@@ -16,11 +16,20 @@ class HiddenRenderObjectError(RuntimeError):
     pass
 
 
+def _hide_render_animated(obj) -> bool:
+    anim = obj.animation_data
+    return (
+        anim is not None
+        and anim.action is not None
+        and any(fc.data_path == "hide_render" for fc in anim.action.fcurves)
+    )
+
+
 def hidden_render_objects(objects: list[pf.MeshObject]) -> dict[str, str]:
     hidden = {}
     for mo in objects:
         obj = mo.item()
-        if obj.hide_render:
+        if obj.hide_render and not _hide_render_animated(obj):
             hidden[obj.name] = "hide_render"
         elif not obj.visible_camera:
             hidden[obj.name] = "visible_camera=False"

@@ -10,6 +10,7 @@ from collections.abc import Callable
 import bpy
 import numpy as np
 import procfunc as pf
+from scipy.ndimage import gaussian_filter1d
 
 import infinigen2.scenes.placement.collision as ccol
 from infinigen2.scenes.placement.retry import repeat_attempts
@@ -218,6 +219,43 @@ def _sample_motion_biased_rotation(
     return target
 
 
+def _samples_free(
+    samples: np.ndarray,
+    colliders: ccol.CollisionSet,
+    bbox: tuple[np.ndarray, np.ndarray],
+    clearance: float,
+) -> bool:
+    # edges only: `point_pred` holds at RRT nodes, not at points along an edge
+    return bool(np.all(samples >= bbox[0]) and np.all(samples <= bbox[1])) and all(
+        _edge_free(a, b, colliders, clearance)
+        for a, b in zip(samples[:-1], samples[1:], strict=True)
+    )
+
+
+def _smooth_path(
+    keyframes: list[tuple[float, np.ndarray]],
+    frame_start: int,
+    frame_end: int,
+    sigma_frames: float,
+    path_free: Callable[[np.ndarray], bool],
+) -> list[tuple[float, np.ndarray]]:
+    """Per-frame Gaussian-smoothed copy of the path, with the window halved until the
+    result passes `path_free`; the input is returned if no window passes."""
+    frames = np.arange(frame_start, frame_end + 1, dtype=np.float64)
+    key_frames = np.asarray([frame for frame, _ in keyframes])
+    key_points = np.asarray([point for _, point in keyframes])
+    dense = np.stack(
+        [np.interp(frames, key_frames, key_points[:, axis]) for axis in range(3)],
+        axis=1,
+    )
+    for _ in range(5):
+        smoothed = gaussian_filter1d(dense, sigma_frames, axis=0, mode="nearest")
+        if path_free(smoothed):
+            return list(zip(frames.tolist(), smoothed, strict=True))
+        sigma_frames /= 2
+    return keyframes
+
+
 def _animate_path_rotation(
     rng: pf.RNG,
     camera: pf.CameraObject,
@@ -267,7 +305,11 @@ def camera_follow_path(
     rotation_lookahead_m: float = 1.0,
     max_abs_roll_deg: float = 25.0,
     max_abs_pitch_offset_deg: float = 25.0,
+    smooth_sec: float = 0.0,
+    path_free: Callable[[np.ndarray], bool] | None = None,
 ) -> pf.CameraObject:
+    """`smooth_sec` > 0 smooths the location (Gaussian, sigma in seconds, kept only
+    where `path_free` accepts the per-frame samples) and eases rotation keyframes."""
     camera = pf.ops.primitives.perspective_camera(focal_length_mm=focal_length_mm)
     points = [np.asarray(point, dtype=np.float64) for point in points]
     segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
@@ -277,13 +319,21 @@ def camera_follow_path(
     else:
         frames = frame_start + (frame_end - frame_start) * arclength / arclength[-1]
         location_keyframes = list(zip(frames.tolist(), points, strict=True))
+    fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
+    if smooth_sec > 0 and len(location_keyframes) > 1:
+        location_keyframes = _smooth_path(
+            location_keyframes,
+            frame_start,
+            frame_end,
+            smooth_sec * fps,
+            path_free or (lambda _: True),
+        )
     for frame, point in location_keyframes:
         camera.item().location = point
         camera.item().keyframe_insert("location", frame=frame)
 
     init_yaw = float(rng.uniform(-np.pi, np.pi))
     camera.item().rotation_euler = (np.pi / 2, 0.0, init_yaw)
-    fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
     _animate_path_rotation(
         rng,
         camera,
@@ -299,8 +349,11 @@ def camera_follow_path(
         np.deg2rad(max_abs_pitch_offset_deg),
     )
     for fcurve in camera.item().animation_data.action.fcurves:
+        eased = smooth_sec > 0 and fcurve.data_path == "rotation_euler"
         for keyframe in fcurve.keyframe_points:
-            keyframe.interpolation = "LINEAR"
+            keyframe.interpolation = "BEZIER" if eased else "LINEAR"
+            if eased:
+                keyframe.handle_left_type = keyframe.handle_right_type = "AUTO_CLAMPED"
     return camera
 
 
@@ -422,6 +475,7 @@ def camera_rrt_trajectory(
     rot_std_deg: tuple[float, float, float] = (20.0, 20.0, 20.0),
     max_abs_roll_deg: float = 25.0,
     max_abs_pitch_offset_deg: float = 25.0,
+    smooth_sec: float = 0.0,
 ) -> pf.CameraObject:
     path_rng, follow_rng = rng.spawn(2)
     low = np.array(bbox[0], dtype=np.float64)
@@ -459,4 +513,6 @@ def camera_rrt_trajectory(
         rot_std_deg=rot_std_deg,
         max_abs_roll_deg=max_abs_roll_deg,
         max_abs_pitch_offset_deg=max_abs_pitch_offset_deg,
+        smooth_sec=smooth_sec,
+        path_free=lambda samples: _samples_free(samples, colliders, bbox, clearance),
     )

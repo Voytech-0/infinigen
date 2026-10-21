@@ -29,6 +29,7 @@ from infinigen2.cameras import (
 from infinigen2.cameras.rrt import RRTPolicyError
 from infinigen2.exporters.realize_mesh import bake_shared_modifier_prefixes
 from infinigen2.exporters.render_cycles import render_cycles
+from infinigen2.exporters.render_eevee import render_eevee
 from infinigen2.exporters.util.format import ExportType, RenderPass
 from infinigen2.scenes.house.furnishings import (
     HouseRoomFurnitureResult,
@@ -52,11 +53,18 @@ from infinigen2.util.polycount import estimated_eval_tricount
 from infinigen2.util.render_metadata import time_step, write_render_metadata
 from infinigen2.util.scene_cleanup import cleanup_except, delete_object, delete_objects
 
+from superposition import make_superposition
+
 logger = logging.getLogger(__name__)
 
 
 def _parse_seed(value: str) -> int:
     return int(value, 0)
+
+
+def _superposition_rng(seed: int) -> np.random.Generator:
+    # a fourth child stream, so the three scene streams stay unchanged
+    return np.random.default_rng(seed).spawn(4)[3]
 
 
 def _connected_rooms_rand(
@@ -233,6 +241,42 @@ def _tour_goals(
     return goals
 
 
+def _tour_goals_by_visits(
+    rng: pf.RNG,
+    colliders: ccol.CollisionSet,
+    rooms: tuple[HouseRoomResult, ...],
+    height_range: tuple[float, float],
+    camera_clearance: float,
+    visits_per_room: int,
+) -> list[np.ndarray]:
+    room_point = partial(
+        _random_point_in_room,
+        rng,
+        colliders=colliders,
+        height_range=height_range,
+        camera_clearance=camera_clearance,
+    )
+    by_index = {room.room_index: room for room in rooms}
+    room = rooms[0]
+    visits = {i: 0 for i in by_index}
+    visits[room.room_index] = 1
+    goals = [room_point(room)]
+    for _ in range(visits_per_room * len(rooms) * 4):
+        if min(visits.values()) >= visits_per_room:
+            return goals
+        neighbors = sorted(set(room.neighbors.values()) & set(by_index))
+        if not neighbors:
+            raise RejectedScene("Tour room has no neighbor inside the tour")
+        fewest = min(visits[i] for i in neighbors)
+        options = [i for i in neighbors if visits[i] == fewest]
+        next_room = by_index[options[int(rng.integers(len(options)))]]
+        goals.append(_doorway_point(room, next_room, height_range))
+        room = next_room
+        visits[room.room_index] += 1
+        goals.append(room_point(room))
+    raise RejectedScene(f"Could not visit every room {visits_per_room} times")
+
+
 def _house_tour_camera_attempt(
     rng: pf.RNG,
     colliders: ccol.CollisionSet,
@@ -242,6 +286,7 @@ def _house_tour_camera_attempt(
     height_range: tuple[float, float],
     camera_clearance: float,
     speed_mps_range: tuple[float, float] = (0.67, 1.0),
+    visits_per_room: int | None = None,
 ) -> pf.CameraObject | None:
     goals_rng, camera_rng = rng.spawn(2)
     fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
@@ -249,9 +294,23 @@ def _house_tour_camera_attempt(
     distance = speed * (frame_end - frame_start) / fps
     plan_clearance = camera_clearance * np.sqrt(3)
     try:
-        goals = _tour_goals(
-            goals_rng, colliders, rooms, height_range, plan_clearance, distance
-        )
+        if visits_per_room:
+            goals = _tour_goals_by_visits(
+                goals_rng,
+                colliders,
+                rooms,
+                height_range,
+                plan_clearance,
+                visits_per_room,
+            )
+            # the tour length sets the duration, at the sampled walking speed
+            distance = np.linalg.norm(np.diff(goals, axis=0), axis=1).sum()
+            frame_end = frame_start + int(np.ceil(distance / speed * fps))
+            bpy.context.scene.frame_end = frame_end
+        else:
+            goals = _tour_goals(
+                goals_rng, colliders, rooms, height_range, plan_clearance, distance
+            )
         logger.info("Tour has %d goals for %.1fm of walking", len(goals), distance)
         camera = camera_rrt_trajectory(
             camera_rng,
@@ -268,6 +327,7 @@ def _house_tour_camera_attempt(
             rot_std_deg=(10.0, 0.0, 0.0),
             max_abs_roll_deg=0.0,
             max_abs_pitch_offset_deg=15.0,
+            smooth_sec=1.0,
         )
     except (RejectedScene, RRTPolicyError) as error:
         logger.info("Rejected house tour plan: %s", error)
@@ -374,6 +434,10 @@ def build_scene(
     frame_end: int = 240,
     resolution: tuple[int, int] = (640, 360),
     room_count: int = 5,
+    visits_per_room: int | None = None,
+    superposition: float | None = None,
+    superposition_spots: int = 3,
+    superposition_cooldown: int = 100,
 ) -> tuple[
     list[pf.Object],
     list[pf.LightObject],
@@ -414,6 +478,7 @@ def build_scene(
             frame_end=frame_end,
             height_range=height_range,
             camera_clearance=camera_clearance,
+            visits_per_room=visits_per_room,
         )
         camera = repeat_attempts(place, rng_camera, attempts=10)
         if camera is None:
@@ -430,6 +495,15 @@ def build_scene(
     objects: list[pf.Object] = list(house.all_objects)
     lights = list(house.lights)
     cleanup_except([*objects, *lights, camera])
+    if superposition is not None:  # after cleanup, which would delete its Empties
+        with time_step(times, "superposition"):
+            make_superposition(
+                _superposition_rng(seed),
+                superposition,
+                superposition_spots,
+                camera.item(),
+                superposition_cooldown,
+            )
     camera.item().name = "Camera"
     return objects, lights, camera, times
 
@@ -457,7 +531,14 @@ def main() -> None:
         help="Seed for room selection and camera motion; defaults to --seed.",
     )
     parser.add_argument("--output", type=Path, default=Path("outputs/house_tour"))
-    parser.add_argument("--frames", type=int, nargs=2, default=(1, 240))
+    parser.add_argument(
+        "--frames",
+        type=int,
+        nargs=2,
+        default=None,
+        help="Frame range to plan the tour over (default 1 240; with --load_blend, "
+        "the saved scene's range).",
+    )
     parser.add_argument(
         "--render_frames",
         type=int,
@@ -468,7 +549,15 @@ def main() -> None:
     )
     parser.add_argument("--resolution", type=int, nargs=2, default=(640, 360))
     parser.add_argument("--samples", type=int, default=128)
+    parser.add_argument("--engine", choices=["cycles", "eevee"], default="cycles")
     parser.add_argument("--room_count", type=int, default=5)
+    parser.add_argument(
+        "--visits_per_room",
+        type=int,
+        default=None,
+        help="Visit every tour room this many times. The tour length then sets "
+        "the frame end, overriding the end of --frames.",
+    )
     parser.add_argument("--save_blend", type=Path, default=None)
     parser.add_argument(
         "--load_blend",
@@ -476,19 +565,52 @@ def main() -> None:
         default=None,
         help="Render a scene saved by --save_blend instead of building one.",
     )
+    parser.add_argument(
+        "--superposition",
+        type=float,
+        default=None,
+        help="Fraction of furnishing units put in superposition: absent or at "
+        "alternative spots, changing only while the camera can't see them. Baked "
+        "at scene creation.",
+    )
+    parser.add_argument("--superposition_spots", type=int, default=3)
+    parser.add_argument(
+        "--superposition_cooldown",
+        type=int,
+        default=100,
+        help="Frames an object must go unseen before it may change.",
+    )
     parser.add_argument("--max_render_tris", type=int, default=32_000_000)
     args = parser.parse_args()
+    if args.load_blend and args.superposition is not None and args.save_blend is None:
+        parser.error(
+            "--superposition on --load_blend needs --save_blend; it is baked at "
+            "scene creation, not render time"
+        )
 
     seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(8), "big")
     trajectory_seed = args.trajectory_seed if args.trajectory_seed is not None else seed
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
-    frame_start, frame_end = args.frames
-    render_start, render_end = args.render_frames or args.frames
+    frame_start, frame_end = args.frames or (1, 240)
+    render_start, render_end = args.render_frames or (frame_start, frame_end)
     resolution = tuple(args.resolution)
 
     if args.load_blend is not None:
         objects, lights, camera, times = load_scene(args.load_blend)
+        if args.frames is None:
+            frame_start = bpy.context.scene.frame_start
+            frame_end = bpy.context.scene.frame_end
+            render_start, render_end = args.render_frames or (frame_start, frame_end)
+        if args.superposition is not None:
+            with time_step(times, "superposition"):
+                make_superposition(
+                    _superposition_rng(seed),
+                    args.superposition,
+                    args.superposition_spots,
+                    camera.item(),
+                    args.superposition_cooldown,
+                )
     else:
         objects, lights, camera, times = build_scene(
             seed,
@@ -497,7 +619,14 @@ def main() -> None:
             frame_end,
             resolution,
             args.room_count,
+            args.visits_per_room,
+            args.superposition,
+            args.superposition_spots,
+            args.superposition_cooldown,
         )
+        if args.visits_per_room:
+            frame_end = bpy.context.scene.frame_end
+            render_start, render_end = args.render_frames or (frame_start, frame_end)
     if args.save_blend is not None:
         pf.ops.file.save_blend(output_path=args.save_blend)
         return
@@ -515,8 +644,10 @@ def main() -> None:
         RenderPass(ExportType.IMAGE, Path("%c/%f.png"), np.dtype(np.uint8)),
         RenderPass(ExportType.CAMERA, Path("%c/camera.npz"), np.dtype(np.float32)),
     ]
+    if args.engine == "eevee":  # eevee exporter rejects CAMERA passes
+        render_passes = [rp for rp in render_passes if rp.type != ExportType.CAMERA]
     with time_step(times, "render"):
-        exports = render_cycles(
+        common = dict(
             objects=objects,
             lights=lights,
             camera=camera,
@@ -525,17 +656,23 @@ def main() -> None:
             frame_start=render_start,
             frame_end=render_end,
             resolution=resolution,
-            min_samples=min(32, args.samples),
-            max_samples=args.samples,
             film_exposure=2.0,
         )
+        if args.engine == "eevee":
+            exports = render_eevee(**common, taa_render_samples=args.samples)
+        else:
+            exports = render_cycles(
+                **common,
+                min_samples=min(32, args.samples),
+                max_samples=args.samples,
+            )
     write_render_metadata(
         output=output,
         seed=seed,
         trajectory_seed=trajectory_seed,
         times=times,
         exports=exports,
-        build_keys={"house", "camera", "small_objects"},
+        build_keys={"house", "camera", "small_objects", "superposition"},
         render_keys={"render"},
         n_frames=render_end - render_start + 1,
     )
